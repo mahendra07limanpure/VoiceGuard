@@ -1,24 +1,69 @@
 import os
-import pickle
+import json
 import numpy as np
 import tensorflow as tf
-from utils.feature_extraction import extract_features
+import librosa
+from scipy.fftpack import dct
+
+# ── Constants (must match the training configuration of best_model.keras) ────────────────
+SR            = 16000
+DURATION      = 4.0
+TARGET_FRAMES = 128
+N_LFCC        = 60
+N_MFCC        = 60
+N_FFT         = 512
+HOP_LENGTH    = 160
+N_FILTERS     = 128
+
+def compute_lfcc(audio):
+    """Linear Frequency Cepstral Coefficients — anti-spoofing standard."""
+    stft  = np.abs(librosa.stft(audio, n_fft=N_FFT, hop_length=HOP_LENGTH)) ** 2
+    freqs = librosa.fft_frequencies(sr=SR, n_fft=N_FFT)
+    lin_f = np.linspace(0, SR // 2, N_FILTERS + 2)
+    fb    = np.zeros((N_FILTERS, len(freqs)))
+    for m in range(1, N_FILTERS + 1):
+        fl, fc, fr = lin_f[m-1], lin_f[m], lin_f[m+1]
+        for k, f in enumerate(freqs):
+            if fl <= f <= fc:  fb[m-1, k] = (f  - fl) /(fc - fl + 1e-8)
+            elif fc < f <= fr: fb[m-1, k] = (fr - f) /(fr - fc + 1e-8)
+    log_spec = np.log(np.dot(fb, stft) + 1e-8)
+    return dct(log_spec, type=2, axis=0, norm='ortho')[:N_LFCC]
+
+def extract_features(file_path):
+    """Extract LFCC + MFCC + Delta-LFCC features. Returns shape (1, 180, 128, 1)."""
+    n = int(SR * DURATION)
+    try:
+        audio, _ = librosa.load(file_path, sr=SR, duration=DURATION)
+    except Exception as e:
+        raise ValueError(f"Could not load audio file: {e}")
+
+    audio = np.pad(audio, (0, max(0, n - len(audio))))[:n]
+    # Pre-emphasis filter
+    audio = np.append(audio[0], audio[1:] - 0.97 * audio[:-1]).astype(np.float32)
+
+    lfcc       = compute_lfcc(audio)
+    mfcc       = librosa.feature.mfcc(y=audio, sr=SR, n_mfcc=N_MFCC, n_fft=N_FFT, hop_length=HOP_LENGTH)
+    lfcc_delta = librosa.feature.delta(lfcc)
+    features   = np.concatenate([lfcc, mfcc, lfcc_delta], axis=0)
+
+    T = features.shape[1]
+    features = np.pad(features, ((0, 0), (0, max(0, TARGET_FRAMES - T))))[:, :TARGET_FRAMES]
+
+    # Per-sample normalization
+    mean = features.mean(axis=1, keepdims=True)
+    std  = features.std(axis=1, keepdims=True) + 1e-6
+    features = (features - mean) / std
+
+    return features.astype(np.float32)[np.newaxis, ..., np.newaxis]  # (1, 180, 128, 1)
 
 def predict_single(file_path, 
-                   model_path='model/voiceguard_cnn_lstm.h5',
-                   norm_path='model/norm_params.pkl',
-                   threshold_path='model/threshold.pkl'):
+                   model_path='model/best_model.keras',
+                   config_path='model/model_config.json',
+                   **kwargs):
     """
-    Full inference pipeline for a single audio file.
+    Full inference pipeline for a single audio file matching the new model configuration.
     
-    Steps:
-    1. Load audio
-    2. Extract MFCC + Mel Spectrogram features
-    3. Normalize using saved mean/std
-    4. Reshape to (1, 128, 128, 2)
-    5. Model predict → raw probability
-    6. Apply optimal threshold
-    7. Return dict:
+    Returns a dict with verification details:
        {
          'label': 'Genuine (Human)' or 'Deepfake (AI-Generated)',
          'confidence': float (0-100),
@@ -30,45 +75,26 @@ def predict_single(file_path,
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Audio file not found at: {file_path}")
         
-    # Load normalization parameters if available
-    mean, std = None, None
-    if os.path.exists(norm_path):
-        with open(norm_path, 'rb') as f:
-            norm_params = pickle.load(f)
-            mean = norm_params.get('mean')
-            std = norm_params.get('std')
-            
-    # Extract features (performs self-normalization first)
-    features = extract_features(file_path)
-    if features is None:
-        raise ValueError(f"Could not extract features from {file_path}. File may be corrupted.")
-        
-    # Apply global normalization using saved mean and std
-    if mean is not None and std is not None:
-        features[:, :, 0] = (features[:, :, 0] - mean[0]) / (std[0] + 1e-8)
-        features[:, :, 1] = (features[:, :, 1] - mean[1]) / (std[1] + 1e-8)
-        
-    # Reshape to (1, 128, 128, 2) for model input
-    features_input = np.expand_dims(features, axis=0)
-    
-    # Load model
     if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model not found at {model_path}. Train the model first.")
+        raise FileNotFoundError(f"Model file not found at: {model_path}")
         
-    # Load TensorFlow Keras model
-    model = tf.keras.models.load_model(model_path)
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Configuration file not found at: {config_path}")
+        
+    # Extract features
+    features_input = extract_features(file_path)
     
-    # Predict raw probability
+    # Load model and config
+    model = tf.keras.models.load_model(model_path)
+    with open(config_path) as f:
+        cfg = json.load(f)
+    threshold = cfg.get("threshold", 0.05)
+    
+    # Run prediction
     prob = float(model.predict(features_input, verbose=0)[0][0])
     
-    # Load optimal threshold
-    threshold = 0.5
-    if os.path.exists(threshold_path):
-        with open(threshold_path, 'rb') as f:
-            threshold = pickle.load(f)
-            
     # Determine label and confidence based on threshold
-    if prob >= threshold:
+    if prob > threshold:
         label = 'Deepfake (AI-Generated)'
         # Scale probability [threshold, 1.0] -> [50, 100] % confidence
         if (1.0 - threshold) > 0:
@@ -98,23 +124,25 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description="VoiceGuard Single Audio Inference")
     parser.add_argument('--audio', required=True, help="Path to the audio file to analyze")
-    parser.add_argument('--model', default='model/voiceguard_cnn_lstm.h5', help="Path to model file")
-    parser.add_argument('--norm', default='model/norm_params.pkl', help="Path to normalization parameters")
-    parser.add_argument('--threshold', default='model/threshold.pkl', help="Path to threshold parameter")
+    parser.add_argument('--model', default='model/best_model.keras', help="Path to model file")
+    parser.add_argument('--config', default='model/model_config.json', help="Path to config file")
     args = parser.parse_args()
     
     try:
         result = predict_single(
             args.audio,
             model_path=args.model,
-            norm_path=args.norm,
-            threshold_path=args.threshold
+            config_path=args.config
         )
-        print(f"\nFile         : {args.audio}")
+        print(f"\n{'='*45}")
+        print("  VoiceGuard Prediction Result")
+        print(f"{'='*45}")
+        print(f"File         : {args.audio}")
         print(f"Result       : {result['label']}")
         print(f"Confidence   : {result['confidence']:.2f}%")
         print(f"Fake Prob    : {result['fake_probability']:.4f}")
         print(f"Real Prob    : {result['real_probability']:.4f}")
         print(f"Threshold    : {result['threshold_used']:.4f}")
+        print(f"{'='*45}\n")
     except Exception as e:
         print(f"Error during prediction: {e}")

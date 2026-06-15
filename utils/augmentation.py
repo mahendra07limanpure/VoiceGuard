@@ -69,6 +69,10 @@ def augment_dataset(X, y, augment_factor=2):
     
     print(f"Starting dataset augmentation (augment_factor={augment_factor})...")
     
+    # To force raw features extraction in augment_dataset, we pass mean=[0,0] and std=[1,1]
+    raw_mean = [0.0, 0.0]
+    raw_std = [1.0, 1.0]
+    
     for item, label in tqdm(zip(X, y), total=len(X), desc="Augmenting dataset"):
         try:
             # 1. Load/get original audio
@@ -77,8 +81,8 @@ def augment_dataset(X, y, augment_factor=2):
             else:
                 y_audio = item.astype(np.float32)
                 
-            # 2. Extract features from original audio
-            feat_orig = extract_features_from_audio(y_audio, sr=sr)
+            # 2. Extract raw features from original audio
+            feat_orig = extract_features_from_audio(y_audio, sr=sr, mean=raw_mean, std=raw_std)
             if feat_orig is not None:
                 X_aug_list.append(feat_orig)
                 y_aug_list.append(label)
@@ -86,7 +90,7 @@ def augment_dataset(X, y, augment_factor=2):
             # 3. Create augment_factor augmented versions
             for _ in range(augment_factor):
                 y_aug = augment_audio(y_audio, sr=sr)
-                feat_aug = extract_features_from_audio(y_aug, sr=sr)
+                feat_aug = extract_features_from_audio(y_aug, sr=sr, mean=raw_mean, std=raw_std)
                 if feat_aug is not None:
                     X_aug_list.append(feat_aug)
                     y_aug_list.append(label)

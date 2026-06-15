@@ -1,5 +1,6 @@
 import os
 import argparse
+import random
 import numpy as np
 import tensorflow as tf
 from sklearn.utils.class_weight import compute_class_weight
@@ -7,6 +8,7 @@ import matplotlib.pyplot as plt
 import librosa
 import librosa.display
 import pickle
+from tqdm import tqdm
 
 from utils.feature_extraction import extract_features, extract_features_from_audio, load_dataset
 from utils.augmentation import augment_dataset
@@ -31,7 +33,12 @@ def build_model(input_shape=(128, 128, 2)):
     x = tf.keras.layers.MaxPooling2D((2,4))(x)
     x = tf.keras.layers.Dropout(0.3)(x)
     
-    # RESHAPE for LSTM
+    # PERMUTE to align width/time as the sequence axis for the LSTM:
+    # From shape (Batch, Height=16, Width=8, Channels=128)
+    # To shape (Batch, Width=8, Height=16, Channels=128)
+    x = tf.keras.layers.Permute((2, 1, 3))(x)
+    
+    # RESHAPE for LSTM: (8 time steps, 16 * 128 features) = (8, 2048)
     x = tf.keras.layers.Reshape((8, -1))(x)
     
     # BiLSTM BLOCK
@@ -73,20 +80,60 @@ def main():
         files = [os.path.join(cat_dir, f) for f in os.listdir(cat_dir) if f.lower().endswith(('.wav', '.mp3', '.flac'))]
         # Apply limit to keep train time reasonable on CPU
         if len(files) > args.limit:
-            import random
             random.seed(42)
             files = random.sample(files, args.limit)
         train_files.extend(files)
         train_labels.extend([cat_label] * len(files))
         
-    print(f"Collected {len(train_files)} files for training split.")
+    # Shuffle train files and labels together
+    combined = list(zip(train_files, train_labels))
+    random.seed(42)
+    random.shuffle(combined)
+    train_files, train_labels = zip(*combined)
+    train_files = list(train_files)
+    train_labels = list(train_labels)
     
-    # 2. Data Augmentation
-    # Double the dataset size: original + 1 augmented version per sample
-    X_train, y_train = augment_dataset(train_files, train_labels, augment_factor=1)
+    # Split into Train (80%) and Val (20%) before augmentation to prevent leakage
+    split_idx = int(len(train_files) * 0.8)
+    train_files_split = train_files[:split_idx]
+    train_labels_split = train_labels[:split_idx]
     
-    # Compute and save normalization params from training features
-    save_norm_params(X_train)
+    val_files_split = train_files[split_idx:]
+    val_labels_split = train_labels[split_idx:]
+    
+    print(f"Dataset split: {len(train_files_split)} training files, {len(val_files_split)} validation files.")
+    
+    # 2. Data Augmentation (augment only training set)
+    # Double training split: original + 1 augmented version per sample
+    X_train, y_train = augment_dataset(train_files_split, train_labels_split, augment_factor=1)
+    
+    # Shuffle training set
+    idx = np.arange(len(X_train))
+    np.random.seed(42)
+    np.random.shuffle(idx)
+    X_train = X_train[idx]
+    y_train = y_train[idx]
+    
+    # Extract features for validation set (no augmentation)
+    print("Extracting validation features...")
+    X_val = []
+    y_val = []
+    for f, l in tqdm(zip(val_files_split, val_labels_split), total=len(val_files_split), desc="Validation Features"):
+        feat = extract_features(f)
+        if feat is not None:
+            X_val.append(feat)
+            y_val.append(l)
+    X_val = np.array(X_val, dtype=np.float32)
+    y_val = np.array(y_val, dtype=np.int32)
+    
+    # Save dummy normalization parameters (row-wise CMVN is used locally)
+    norm_params = {
+        'mean': [0.0, 0.0],
+        'std': [1.0, 1.0]
+    }
+    with open('model/norm_params.pkl', 'wb') as f:
+        pickle.dump(norm_params, f)
+    print("Saved dummy normalization parameters to model/norm_params.pkl")
     
     # 3. Load Testing data (no augmentation)
     print("Extracting testing features...")
@@ -121,7 +168,7 @@ def main():
         X_train, y_train,
         epochs=args.epochs,
         batch_size=32,
-        validation_split=0.2,
+        validation_data=(X_val, y_val),
         class_weight=class_weight_dict,
         callbacks=callbacks
     )
